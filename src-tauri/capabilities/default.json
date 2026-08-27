@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Minimal VoxType window permissions",
+  "windows": ["settings", "overlay"],
+  "permissions": [
+    "core:default",
+    "opener:default"
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "name": "voxtype",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "check": "tsc --noEmit",
+    "test": "cargo test --manifest-path src-tauri/Cargo.toml --lib",
+    "bundle:app": "bash scripts/package-local.sh --app-only",
+    "bundle:dmg": "bash scripts/package-local.sh",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-opener": "^2"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "vite": "^6.0.3",
+    "typescript": "~5.6.2"
+  }
+}
