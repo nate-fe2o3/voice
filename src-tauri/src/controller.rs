@@ -630,6 +630,11 @@ impl Controller {
                         self.return_ready(status);
                     }
                     RecordingDestination::Dictation(target) => {
+                        let transcript = macos::adjust_leading_capitalization(
+                            &transcript,
+                            target.context,
+                            &self.settings().preferred_terms,
+                        );
                         if transcript.is_empty() {
                             self.return_ready("No speech detected");
                         } else if !target.is_still_focused() {
