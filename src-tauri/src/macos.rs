@@ -285,14 +285,45 @@ fn prime_event_pipeline(source: &CGEventSource) -> Result<()> {
     Ok(())
 }
 
+/// `NSWindowCollectionBehaviorCanJoinAllSpaces` from `<AppKit/NSWindow.h>`
+/// (value 1 << 0): the window is shown on every Space rather than only the
+/// Space that was active when it was ordered front.
+const NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES: usize = 1 << 0;
+
+/// `NSWindowCollectionBehaviorStationary` from `<AppKit/NSWindow.h>`
+/// (value 1 << 4): the window does not move during Exposé/Space switches.
+const NS_WINDOW_COLLECTION_BEHAVIOR_STATIONARY: usize = 1 << 4;
+
+/// `NSWindowCollectionBehaviorFullScreenAuxiliary` from `<AppKit/NSWindow.h>`
+/// (value 1 << 8): the window may be shown alongside another app's native
+/// fullscreen window on that app's dedicated fullscreen Space.
+const NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY: usize = 1 << 8;
+
+/// `NSStatusWindowLevel` from `<AppKit/NSWindow.h>`: above normal and floating
+/// windows, so the overlay stays visible over fullscreen apps.
+const NS_STATUS_WINDOW_LEVEL: isize = 25;
+
+/// Collection behavior that lets the recording HUD join every Space, including
+/// the dedicated Space another app creates when it enters native fullscreen.
+fn overlay_collection_behavior() -> usize {
+    NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES
+        | NS_WINDOW_COLLECTION_BEHAVIOR_STATIONARY
+        | NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY
+}
+
 #[allow(unexpected_cfgs)]
 pub fn show_without_activation(window: &WebviewWindow) -> Result<()> {
     use objc::runtime::Object;
     use objc::{msg_send, sel, sel_impl};
 
     let ns_window = window.ns_window().context("get native overlay window")?;
+    let behavior = overlay_collection_behavior();
+    let level = NS_STATUS_WINDOW_LEVEL;
     unsafe {
-        let _: () = msg_send![ns_window.cast::<Object>(), orderFrontRegardless];
+        let ns_window = ns_window.cast::<Object>();
+        let _: () = msg_send![ns_window, setCollectionBehavior: behavior];
+        let _: () = msg_send![ns_window, setLevel: level];
+        let _: () = msg_send![ns_window, orderFrontRegardless];
     }
     Ok(())
 }
@@ -479,5 +510,26 @@ mod tests {
         for event in &events {
             assert!(event.get_flags().contains(CGEventFlags::CGEventFlagCommand));
         }
+    }
+
+    #[test]
+    fn overlay_collection_behavior_matches_named_options() {
+        assert_eq!(overlay_collection_behavior(), 273);
+        assert_eq!(NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES, 1 << 0);
+        assert_eq!(NS_WINDOW_COLLECTION_BEHAVIOR_STATIONARY, 1 << 4);
+        assert_eq!(NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY, 1 << 8);
+        let behavior = overlay_collection_behavior();
+        assert_eq!(
+            behavior & NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES,
+            NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES
+        );
+        assert_eq!(
+            behavior & NS_WINDOW_COLLECTION_BEHAVIOR_STATIONARY,
+            NS_WINDOW_COLLECTION_BEHAVIOR_STATIONARY
+        );
+        assert_eq!(
+            behavior & NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY,
+            NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY
+        );
     }
 }
