@@ -1,21 +1,21 @@
 use anyhow::{Context, Result};
 use core_foundation::base::{CFType, TCFType};
 use core_foundation::string::{CFString, CFStringRef};
-use core_foundation_sys::base::{Boolean, CFEqual, CFRelease, CFRetain, CFTypeRef};
 use core_foundation_sys::base::kCFAllocatorDefault;
-use core_foundation_sys::number::kCFBooleanTrue;
+use core_foundation_sys::base::{Boolean, CFEqual, CFRelease, CFRetain, CFTypeRef};
 use core_foundation_sys::dictionary::{
     kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks, CFDictionaryCreate,
     CFDictionaryRef,
 };
+use core_foundation_sys::number::kCFBooleanTrue;
 use libc::{c_char, c_int, c_void, pid_t};
 use rdev::{simulate, EventType, Key};
 use serde::Serialize;
-use tauri::WebviewWindow;
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
+use tauri::WebviewWindow;
 
 type AxUiElementRef = *const c_void;
 type AxError = i32;
@@ -219,9 +219,34 @@ pub fn synthesize_paste() -> Result<()> {
     thread::sleep(Duration::from_millis(8));
     let press = simulate(&EventType::KeyPress(Key::KeyV)).context("press V");
     let release_v = simulate(&EventType::KeyRelease(Key::KeyV)).context("release V");
-    let release_meta =
-        simulate(&EventType::KeyRelease(Key::MetaLeft)).context("release Command");
+    let release_meta = simulate(&EventType::KeyRelease(Key::MetaLeft)).context("release Command");
     press.and(release_v).and(release_meta)
+}
+
+/// `NSWindowCollectionBehaviorCanJoinAllSpaces` from `<AppKit/NSWindow.h>`
+/// (value 1 << 0): the window is shown on every Space rather than only the
+/// Space that was active when it was ordered front.
+const NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES: usize = 1 << 0;
+
+/// `NSWindowCollectionBehaviorStationary` from `<AppKit/NSWindow.h>`
+/// (value 1 << 4): the window does not move during Exposé/Space switches.
+const NS_WINDOW_COLLECTION_BEHAVIOR_STATIONARY: usize = 1 << 4;
+
+/// `NSWindowCollectionBehaviorFullScreenAuxiliary` from `<AppKit/NSWindow.h>`
+/// (value 1 << 8): the window may be shown alongside another app's native
+/// fullscreen window on that app's dedicated fullscreen Space.
+const NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY: usize = 1 << 8;
+
+/// `NSStatusWindowLevel` from `<AppKit/NSWindow.h>`: above normal and floating
+/// windows, so the overlay stays visible over fullscreen apps.
+const NS_STATUS_WINDOW_LEVEL: isize = 25;
+
+/// Collection behavior that lets the recording HUD join every Space, including
+/// the dedicated Space another app creates when it enters native fullscreen.
+fn overlay_collection_behavior() -> usize {
+    NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES
+        | NS_WINDOW_COLLECTION_BEHAVIOR_STATIONARY
+        | NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY
 }
 
 #[allow(unexpected_cfgs)]
@@ -230,8 +255,13 @@ pub fn show_without_activation(window: &WebviewWindow) -> Result<()> {
     use objc::{msg_send, sel, sel_impl};
 
     let ns_window = window.ns_window().context("get native overlay window")?;
+    let behavior = overlay_collection_behavior();
+    let level = NS_STATUS_WINDOW_LEVEL;
     unsafe {
-        let _: () = msg_send![ns_window.cast::<Object>(), orderFrontRegardless];
+        let ns_window = ns_window.cast::<Object>();
+        let _: () = msg_send![ns_window, setCollectionBehavior: behavior];
+        let _: () = msg_send![ns_window, setLevel: level];
+        let _: () = msg_send![ns_window, orderFrontRegardless];
     }
     Ok(())
 }
@@ -361,8 +391,13 @@ fn bundle_identifier(pid: pid_t) -> Option<String> {
 
 fn process_path(pid: pid_t) -> Option<PathBuf> {
     let mut buffer = vec![0_u8; 4096];
-    let length =
-        unsafe { proc_pidpath(pid, buffer.as_mut_ptr().cast::<c_void>(), buffer.len() as u32) };
+    let length = unsafe {
+        proc_pidpath(
+            pid,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            buffer.len() as u32,
+        )
+    };
     if length <= 0 {
         return None;
     }
@@ -391,6 +426,27 @@ mod tests {
         assert_eq!(
             app_bundle_path(path).unwrap(),
             Path::new("/Applications/TextEdit.app")
+        );
+    }
+
+    #[test]
+    fn overlay_collection_behavior_matches_named_options() {
+        assert_eq!(overlay_collection_behavior(), 273);
+        assert_eq!(NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES, 1 << 0);
+        assert_eq!(NS_WINDOW_COLLECTION_BEHAVIOR_STATIONARY, 1 << 4);
+        assert_eq!(NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY, 1 << 8);
+        let behavior = overlay_collection_behavior();
+        assert_eq!(
+            behavior & NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES,
+            NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES
+        );
+        assert_eq!(
+            behavior & NS_WINDOW_COLLECTION_BEHAVIOR_STATIONARY,
+            NS_WINDOW_COLLECTION_BEHAVIOR_STATIONARY
+        );
+        assert_eq!(
+            behavior & NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY,
+            NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY
         );
     }
 }
