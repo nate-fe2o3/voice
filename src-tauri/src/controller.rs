@@ -9,9 +9,7 @@ use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, Position};
 use crate::audio::{AudioEvent, AudioRecorder};
 use crate::clipboard::ClipboardTransaction;
 use crate::macos::{self, FocusedTarget};
-use crate::model::{
-    self, ModelCommand, ModelEvent, ModelService,
-};
+use crate::model::{self, ModelCommand, ModelEvent, ModelService};
 use crate::settings::{settings_path, Settings};
 use crate::state::{AppSnapshot, Phase};
 use serde::Serialize;
@@ -169,9 +167,9 @@ impl Controller {
                 })?;
         }
         if installed {
-            controller
-                .model
-                .send(ModelCommand::Load(model::model_dir(&controller.app_data_dir)))?;
+            controller.model.send(ModelCommand::Load(model::model_dir(
+                &controller.app_data_dir,
+            )))?;
         }
         controller.emit_snapshot();
         Ok(controller)
@@ -228,9 +226,7 @@ impl Controller {
                 snapshot.phase = Phase::Ready;
                 snapshot.status = ready_status;
                 snapshot.error = None;
-            } else if (!trusted || !input_monitoring_trusted)
-                && snapshot.phase == Phase::Ready
-            {
+            } else if (!trusted || !input_monitoring_trusted) && snapshot.phase == Phase::Ready {
                 snapshot.phase = Phase::Onboarding;
                 snapshot.status = if !trusted {
                     "Accessibility permission is required"
@@ -254,7 +250,10 @@ impl Controller {
         if !can_begin_recording(&self.snapshot(), false) {
             if phase == Phase::Loading {
                 self.show_overlay_with_status("Model warming up…");
-            } else if matches!(phase, Phase::Finalizing | Phase::PasteRecovery | Phase::Recording) {
+            } else if matches!(
+                phase,
+                Phase::Finalizing | Phase::PasteRecovery | Phase::Recording
+            ) {
                 self.show_overlay_with_status("VoxType is busy");
             } else {
                 self.show_overlay_with_status(&self.snapshot().status);
@@ -269,11 +268,9 @@ impl Controller {
                 return;
             }
         };
-        if let Err(error) = self.start_recording(
-            &settings,
-            RecordingDestination::Dictation(target),
-            true,
-        ) {
+        if let Err(error) =
+            self.start_recording(&settings, RecordingDestination::Dictation(target), true)
+        {
             self.transient_error(error);
         }
     }
@@ -356,10 +353,7 @@ impl Controller {
             self.return_ready(status);
             return;
         }
-        *self
-            .pending_destination
-            .lock()
-            .expect("destination lock") = Some(session.destination);
+        *self.pending_destination.lock().expect("destination lock") = Some(session.destination);
         self.mutate_snapshot(|snapshot| {
             snapshot.phase = Phase::Finalizing;
             snapshot.status = "Finalizing…".into();
@@ -409,7 +403,13 @@ impl Controller {
     }
 
     pub fn discard_recovery(&self) {
-        if self.recovery.lock().expect("recovery lock").take().is_some() {
+        if self
+            .recovery
+            .lock()
+            .expect("recovery lock")
+            .take()
+            .is_some()
+        {
             self.return_ready("Transcript discarded");
         }
     }
@@ -502,6 +502,7 @@ impl Controller {
                 let mut last_check = SystemTime::now();
                 let mut was_trusted = macos::accessibility_trusted();
                 let mut was_input_monitoring_trusted = macos::input_monitoring_trusted();
+                let mut last_frontmost_pid = macos::frontmost_application_pid().unwrap_or_default();
                 loop {
                     std::thread::sleep(Duration::from_secs(2));
                     let Some(controller) = weak.upgrade() else {
@@ -513,6 +514,15 @@ impl Controller {
                         .is_ok_and(|elapsed| elapsed > Duration::from_secs(10));
                     let trusted = macos::accessibility_trusted();
                     let input_monitoring_trusted = macos::input_monitoring_trusted();
+                    // A browser (Firefox) keeps its accessibility tree disabled
+                    // until an assistive client opts in, so warm the frontmost
+                    // application up as soon as the user switches to it. Errors
+                    // are ignored and this never blocks the watchdog loop.
+                    let frontmost_pid = macos::frontmost_application_pid().unwrap_or_default();
+                    if frontmost_pid != 0 && frontmost_pid != last_frontmost_pid {
+                        macos::warm_up_frontmost_application();
+                    }
+                    last_frontmost_pid = frontmost_pid;
                     if slept
                         || trusted != was_trusted
                         || input_monitoring_trusted != was_input_monitoring_trusted
@@ -751,7 +761,11 @@ impl Controller {
             .lock()
             .expect("destination lock")
             .take();
-        let downloading = self.download_cancel.lock().expect("download lock").is_some();
+        let downloading = self
+            .download_cancel
+            .lock()
+            .expect("download lock")
+            .is_some();
         self.mutate_snapshot(|snapshot| {
             snapshot.phase = if downloading {
                 Phase::Onboarding
@@ -889,8 +903,7 @@ impl Controller {
                     let height = (116.0 * scale) as i32;
                     let x = monitor_position.x + (monitor_size.width as i32 - width) / 2;
                     let y = monitor_position.y + monitor_size.height as i32 - height - 72;
-                    let _ =
-                        window.set_position(Position::Physical(PhysicalPosition::new(x, y)));
+                    let _ = window.set_position(Position::Physical(PhysicalPosition::new(x, y)));
                 }
             }
             if macos::show_without_activation(&window).is_err() {
@@ -913,7 +926,10 @@ impl Controller {
             let Some(controller) = app.try_state::<Arc<Controller>>() else {
                 return;
             };
-            if matches!(controller.snapshot().phase, Phase::Ready | Phase::Onboarding) {
+            if matches!(
+                controller.snapshot().phase,
+                Phase::Ready | Phase::Onboarding
+            ) {
                 let main_app = app.clone();
                 let _ = app.run_on_main_thread(move || {
                     if let Some(window) = main_app.get_webview_window("overlay") {
