@@ -16,7 +16,7 @@ use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::WebviewWindow;
 
 type AxUiElementRef = *const c_void;
@@ -27,6 +27,15 @@ const AX_SUCCESS: AxError = 0;
 const COMMAND_KEYCODE: u16 = 55;
 const V_KEYCODE: u16 = 9;
 const POST_DELAYS_MS: [u64; 3] = [12, 20, 20];
+
+/// How long the application-level fallback keeps polling for a focused element.
+const FOCUS_QUERY_TIMEOUT: Duration = Duration::from_millis(2500);
+/// Poll interval for the application-level focused element fallback.
+const FOCUS_QUERY_POLL: Duration = Duration::from_millis(50);
+/// Re-send the accessibility opt-in in the fallback every this many polls.
+const FOCUS_REWARM_INTERVAL: usize = 5;
+/// Extra grace period granted to a capture that starts with a cold tree.
+const CAPTURE_RETRY_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
@@ -101,21 +110,54 @@ impl FocusedTarget {
         if !accessibility_trusted() {
             anyhow::bail!("Accessibility permission is required");
         }
-        let element = focused_element()?;
+        let element = match focused_element() {
+            Ok(element) => element,
+            Err(error) => {
+                // A browser may only build its accessibility tree after the
+                // first opt-in request; give the frontmost application a short
+                // grace period before surfacing the failure. A capture that
+                // succeeds immediately never pays this extra latency.
+                match focused_element_with_timeout(CAPTURE_RETRY_TIMEOUT) {
+                    Ok(element) => element,
+                    Err(retry_error) => {
+                        let pid = frontmost_application_pid().unwrap_or_default();
+                        log::warn!(
+                            "focus capture failed for pid={pid}, bundle_id={:?}, role=\"\", error=\"{error}\" (retry error: \"{retry_error}\")",
+                            bundle_identifier(pid)
+                        );
+                        return Err(error);
+                    }
+                }
+            }
+        };
         let mut pid = 0;
         let status = unsafe { AXUIElementGetPid(element, &mut pid) };
         if status != AX_SUCCESS {
             unsafe { CFRelease(element) };
+            log_capture_failure(0, "", None, "could not identify the focused application");
             anyhow::bail!("could not identify the focused application");
         }
         let role = copy_string_attribute(element, "AXRole").unwrap_or_default();
         let subrole = copy_string_attribute(element, "AXSubrole").unwrap_or_default();
+        let bundle_id = bundle_identifier(pid);
         if role.is_empty() {
             unsafe { CFRelease(element) };
+            log_capture_failure(
+                pid,
+                &role,
+                bundle_id.as_deref(),
+                "no editable text field is focused",
+            );
             anyhow::bail!("no editable text field is focused");
         }
         if role == "AXSecureTextField" || subrole == "AXSecureTextField" {
             unsafe { CFRelease(element) };
+            log_capture_failure(
+                pid,
+                &role,
+                bundle_id.as_deref(),
+                "Dictation is unavailable in secure text fields",
+            );
             anyhow::bail!("Dictation is unavailable in secure text fields");
         }
         let mut settable: Boolean = 0;
@@ -133,15 +175,26 @@ impl FocusedTarget {
         );
         if status != AX_SUCCESS || (settable == 0 && !editable_role) {
             unsafe { CFRelease(element) };
+            log_capture_failure(
+                pid,
+                &role,
+                bundle_id.as_deref(),
+                "Focus an editable text field before dictating",
+            );
             anyhow::bail!("Focus an editable text field before dictating");
         }
-        let bundle_id = bundle_identifier(pid);
         if bundle_id.as_ref().is_some_and(|bundle| {
             excluded_apps
                 .iter()
                 .any(|excluded| excluded.eq_ignore_ascii_case(bundle))
         }) {
             unsafe { CFRelease(element) };
+            log_capture_failure(
+                pid,
+                &role,
+                bundle_id.as_deref(),
+                "VoxType is disabled for this application",
+            );
             anyhow::bail!("VoxType is disabled for this application");
         }
         Ok(Self {
@@ -351,6 +404,10 @@ fn activate_application(pid: i32) -> Result<()> {
 }
 
 fn focused_element() -> Result<AxUiElementRef> {
+    focused_element_with_timeout(FOCUS_QUERY_TIMEOUT)
+}
+
+fn focused_element_with_timeout(timeout: Duration) -> Result<AxUiElementRef> {
     let system = unsafe { AXUIElementCreateSystemWide() };
     if system.is_null() {
         anyhow::bail!("could not access the macOS accessibility system");
@@ -361,6 +418,11 @@ fn focused_element() -> Result<AxUiElementRef> {
         return Ok(focused);
     }
 
+    // Firefox (Gecko) and Chromium keep their macOS accessibility tree
+    // disabled until an assistive client explicitly opts in, so enable the
+    // frontmost application before querying its element tree.
+    warm_up_frontmost_application();
+
     let pid = frontmost_application_pid()
         .context("identify the frontmost application for accessibility fallback")?;
     let application = unsafe { AXUIElementCreateApplication(pid) };
@@ -368,22 +430,103 @@ fn focused_element() -> Result<AxUiElementRef> {
         anyhow::bail!("could not access the frontmost application");
     }
 
-    // Firefox creates its macOS accessibility tree lazily when an assistive
-    // client first queries the application role.
-    let _ = copy_string_attribute(application, "AXRole");
-    for _ in 0..20 {
-        if let Some(focused) = copy_focused_element(application) {
+    let polls = warmup_poll_count(timeout, FOCUS_QUERY_POLL);
+    let deadline = Instant::now() + timeout;
+    for attempt in 0..polls {
+        if let Some(focused) = focused_element_for_application(application) {
             unsafe { CFRelease(application) };
             return Ok(focused);
         }
-        thread::sleep(Duration::from_millis(25));
+        // The application may only build its tree after it has processed the
+        // opt-in request, so keep re-warming while we wait.
+        if attempt % FOCUS_REWARM_INTERVAL == 0 {
+            warm_up_accessibility(pid);
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(FOCUS_QUERY_POLL);
     }
     unsafe { CFRelease(application) };
     anyhow::bail!("no editable text field is focused");
 }
 
+/// Query an application element for its focused element, falling back to the
+/// application's focused window when the application level query is empty.
+///
+/// Firefox exposes the focused URL/search field through the focused window
+/// rather than directly on the application element once accessibility has just
+/// been enabled, so the window level query is tried as well.
+fn focused_element_for_application(application: AxUiElementRef) -> Option<AxUiElementRef> {
+    if let Some(focused) = copy_focused_element(application) {
+        return Some(focused);
+    }
+    let window = copy_element_attribute(application, "AXFocusedWindow")?;
+    let focused = copy_focused_element(window);
+    unsafe { CFRelease(window) };
+    focused
+}
+
+/// Enable the target application's macOS accessibility tree.
+///
+/// Firefox (Gecko) and Chromium-based applications keep their accessibility
+/// tree disabled until an assistive client explicitly opts in. Without this
+/// they return no `AXFocusedUIElement` (including for the URL/search bar), so
+/// dictation never captures the focused field. `AXEnhancedUserInterface` is
+/// the Firefox/WebKit opt-in and `AXManualAccessibility` the Chromium/Electron
+/// one; an application that does not support a given attribute returns an
+/// error that is expected and ignored.
+fn warm_up_accessibility(pid: i32) {
+    let application = unsafe { AXUIElementCreateApplication(pid) };
+    if application.is_null() {
+        return;
+    }
+    for attribute in ["AXEnhancedUserInterface", "AXManualAccessibility"] {
+        let name = CFString::new(attribute);
+        let status = unsafe {
+            AXUIElementSetAttributeValue(
+                application,
+                name.as_concrete_TypeRef(),
+                kCFBooleanTrue.cast(),
+            )
+        };
+        log::debug!("accessibility warm-up pid={pid} attribute={attribute} status={status}");
+    }
+    unsafe { CFRelease(application) };
+}
+
+/// Enable accessibility for the frontmost application, ignoring any failure.
+///
+/// Exposed so the privacy watchdog can warm an application up as soon as it
+/// becomes frontmost, before the user reaches for the dictation hotkey.
+pub fn warm_up_frontmost_application() {
+    if let Ok(pid) = frontmost_application_pid() {
+        warm_up_accessibility(pid);
+    }
+}
+
+/// Number of polls to attempt before `timeout` elapses. Extracted so the retry
+/// timing can be unit-tested without sleeping.
+fn warmup_poll_count(timeout: Duration, poll: Duration) -> usize {
+    if poll.is_zero() {
+        return 1;
+    }
+    let polls = timeout.as_nanos() / poll.as_nanos();
+    usize::try_from(polls).unwrap_or(usize::MAX).max(1)
+}
+
+fn log_capture_failure(pid: i32, role: &str, bundle_id: Option<&str>, error: &str) {
+    log::debug!(
+        "focus capture failed: pid={pid}, role=\"{role}\", bundle_id={bundle_id:?}, error=\"{error}\""
+    );
+}
+
 fn copy_focused_element(element: AxUiElementRef) -> Option<AxUiElementRef> {
-    let attribute = CFString::new("AXFocusedUIElement");
+    copy_element_attribute(element, "AXFocusedUIElement")
+}
+
+fn copy_element_attribute(element: AxUiElementRef, name: &str) -> Option<AxUiElementRef> {
+    let attribute = CFString::new(name);
     let mut value: CFTypeRef = std::ptr::null();
     let status = unsafe {
         AXUIElementCopyAttributeValue(
@@ -399,7 +542,7 @@ fn copy_focused_element(element: AxUiElementRef) -> Option<AxUiElementRef> {
 }
 
 #[allow(unexpected_cfgs)]
-fn frontmost_application_pid() -> Result<pid_t> {
+pub fn frontmost_application_pid() -> Result<pid_t> {
     use objc::runtime::Object;
     use objc::{class, msg_send, sel, sel_impl};
 
@@ -530,6 +673,38 @@ mod tests {
         assert_eq!(
             behavior & NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY,
             NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY
+        );
+    }
+
+    #[test]
+    fn poll_count_rounds_timeout_down_to_polls() {
+        assert_eq!(
+            warmup_poll_count(Duration::from_millis(2500), Duration::from_millis(50)),
+            50
+        );
+        assert_eq!(
+            warmup_poll_count(Duration::from_millis(1500), Duration::from_millis(50)),
+            30
+        );
+    }
+
+    #[test]
+    fn poll_count_is_at_least_one() {
+        assert_eq!(
+            warmup_poll_count(Duration::from_millis(10), Duration::from_millis(50)),
+            1
+        );
+        assert_eq!(
+            warmup_poll_count(Duration::ZERO, Duration::from_millis(50)),
+            1
+        );
+    }
+
+    #[test]
+    fn poll_count_handles_zero_poll_interval() {
+        assert_eq!(
+            warmup_poll_count(Duration::from_millis(2500), Duration::ZERO),
+            1
         );
     }
 }
