@@ -27,6 +27,7 @@ unsafe extern "C" {
     fn AXIsProcessTrusted() -> Boolean;
     fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> Boolean;
     static kAXTrustedCheckOptionPrompt: CFStringRef;
+    fn AXUIElementCreateApplication(pid: pid_t) -> AxUiElementRef;
     fn AXUIElementCreateSystemWide() -> AxUiElementRef;
     fn AXUIElementCopyAttributeValue(
         element: AxUiElementRef,
@@ -38,6 +39,11 @@ unsafe extern "C" {
         element: AxUiElementRef,
         attribute: CFStringRef,
         settable: *mut Boolean,
+    ) -> AxError;
+    fn AXUIElementSetAttributeValue(
+        element: AxUiElementRef,
+        attribute: CFStringRef,
+        value: CFTypeRef,
     ) -> AxError;
     fn CGPreflightListenEventAccess() -> bool;
     fn CGRequestListenEventAccess() -> bool;
@@ -150,6 +156,29 @@ impl FocusedTarget {
         unsafe { CFRelease(current) };
         same
     }
+
+    pub fn restore_focus(&self) -> Result<()> {
+        activate_application(self.description.pid)?;
+        let attribute = CFString::new("AXFocused");
+        let mut last_status = AX_SUCCESS;
+        for _ in 0..10 {
+            if self.is_still_focused() {
+                return Ok(());
+            }
+            last_status = unsafe {
+                AXUIElementSetAttributeValue(
+                    self.element,
+                    attribute.as_concrete_TypeRef(),
+                    kCFBooleanTrue.cast(),
+                )
+            };
+            thread::sleep(Duration::from_millis(20));
+        }
+        if last_status != AX_SUCCESS {
+            anyhow::bail!("could not refocus the original text field (AX error {last_status})");
+        }
+        anyhow::bail!("the original text field did not regain focus");
+    }
 }
 
 pub fn accessibility_trusted() -> bool {
@@ -207,25 +236,96 @@ pub fn show_without_activation(window: &WebviewWindow) -> Result<()> {
     Ok(())
 }
 
+#[allow(unexpected_cfgs)]
+fn activate_application(pid: i32) -> Result<()> {
+    use objc::runtime::{Object, BOOL, NO};
+    use objc::{class, msg_send, sel, sel_impl};
+
+    const ACTIVATE_IGNORING_OTHER_APPS: usize = 1 << 1;
+
+    unsafe {
+        let application: *mut Object =
+            msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
+        if application.is_null() {
+            anyhow::bail!("the original application is no longer running");
+        }
+        let activated: BOOL =
+            msg_send![application, activateWithOptions: ACTIVATE_IGNORING_OTHER_APPS];
+        if activated == NO {
+            anyhow::bail!("the original application could not be activated");
+        }
+    }
+    Ok(())
+}
+
 fn focused_element() -> Result<AxUiElementRef> {
     let system = unsafe { AXUIElementCreateSystemWide() };
     if system.is_null() {
         anyhow::bail!("could not access the macOS accessibility system");
     }
+    let focused = copy_focused_element(system);
+    unsafe { CFRelease(system) };
+    if let Some(focused) = focused {
+        return Ok(focused);
+    }
+
+    let pid = frontmost_application_pid()
+        .context("identify the frontmost application for accessibility fallback")?;
+    let application = unsafe { AXUIElementCreateApplication(pid) };
+    if application.is_null() {
+        anyhow::bail!("could not access the frontmost application");
+    }
+
+    // Firefox creates its macOS accessibility tree lazily when an assistive
+    // client first queries the application role.
+    let _ = copy_string_attribute(application, "AXRole");
+    for _ in 0..20 {
+        if let Some(focused) = copy_focused_element(application) {
+            unsafe { CFRelease(application) };
+            return Ok(focused);
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    unsafe { CFRelease(application) };
+    anyhow::bail!("no editable text field is focused");
+}
+
+fn copy_focused_element(element: AxUiElementRef) -> Option<AxUiElementRef> {
     let attribute = CFString::new("AXFocusedUIElement");
     let mut value: CFTypeRef = std::ptr::null();
     let status = unsafe {
         AXUIElementCopyAttributeValue(
-            system,
+            element,
             attribute.as_concrete_TypeRef(),
             &mut value as *mut CFTypeRef,
         )
     };
-    unsafe { CFRelease(system) };
     if status != AX_SUCCESS || value.is_null() {
-        anyhow::bail!("no editable text field is focused");
+        return None;
     }
-    Ok(value.cast())
+    Some(value.cast())
+}
+
+#[allow(unexpected_cfgs)]
+fn frontmost_application_pid() -> Result<pid_t> {
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+
+    unsafe {
+        let workspace: *mut Object = msg_send![class!(NSWorkspace), sharedWorkspace];
+        if workspace.is_null() {
+            anyhow::bail!("could not access the macOS workspace");
+        }
+        let application: *mut Object = msg_send![workspace, frontmostApplication];
+        if application.is_null() {
+            anyhow::bail!("no application is frontmost");
+        }
+        let pid: pid_t = msg_send![application, processIdentifier];
+        if pid <= 0 {
+            anyhow::bail!("the frontmost application has no process identifier");
+        }
+        Ok(pid)
+    }
 }
 
 fn copy_string_attribute(element: AxUiElementRef, name: &str) -> Option<String> {

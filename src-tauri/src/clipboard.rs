@@ -1,11 +1,8 @@
 use anyhow::Result;
 use clipboard_rs::common::ClipboardContent;
 use clipboard_rs::{Clipboard, ClipboardContext};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const OWNERSHIP_FORMAT: &str = "com.nbutton.voxtype.transaction";
-static TRANSACTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct ClipboardTransaction {
     previous: Vec<ClipboardContent>,
@@ -69,12 +66,7 @@ fn clipboard_result<T>(result: clipboard_rs::common::Result<T>, action: &str) ->
 }
 
 fn unique_marker() -> Vec<u8> {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let counter = TRANSACTION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{timestamp:x}-{counter:x}").into_bytes()
+    uuid::Uuid::new_v4().as_bytes().to_vec()
 }
 
 #[cfg(test)]
@@ -83,6 +75,8 @@ mod tests {
 
     #[test]
     fn markers_are_unique() {
-        assert_ne!(unique_marker(), unique_marker());
+        let first = unique_marker();
+        assert_eq!(first.len(), 16);
+        assert_ne!(first, unique_marker());
     }
 }

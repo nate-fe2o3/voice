@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -67,10 +68,15 @@ impl Settings {
         normalized.normalize()?;
         let parent = path.parent().context("settings path has no parent")?;
         fs::create_dir_all(parent).context("create settings directory")?;
-        let temporary = path.with_extension("json.tmp");
-        fs::write(&temporary, serde_json::to_vec_pretty(&normalized)?)
+        let mut temporary =
+            tempfile::NamedTempFile::new_in(parent).context("create temporary settings file")?;
+        serde_json::to_writer_pretty(temporary.as_file_mut(), &normalized)
             .context("write temporary settings")?;
-        fs::rename(&temporary, path).context("replace settings")?;
+        temporary.as_file_mut().flush().context("flush settings")?;
+        temporary
+            .persist(path)
+            .map_err(|error| error.error)
+            .context("replace settings")?;
         Ok(())
     }
 
@@ -137,5 +143,23 @@ mod tests {
             ..Settings::default()
         };
         assert!(settings.normalize().is_err());
+    }
+
+    #[test]
+    fn saves_and_replaces_settings_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let mut settings = Settings {
+            preferred_terms: vec![" first ".into()],
+            ..Settings::default()
+        };
+
+        settings.save(&path).unwrap();
+        settings.preferred_terms = vec!["second".into()];
+        settings.save(&path).unwrap();
+
+        let loaded = Settings::load(&path).unwrap();
+        assert_eq!(loaded.preferred_terms, vec!["second"]);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }

@@ -8,9 +8,10 @@ mod settings;
 mod state;
 
 use controller::Controller;
-use settings::Settings;
 use serde::Serialize;
+use settings::Settings;
 use state::AppSnapshot;
+use std::fmt::Display;
 use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -18,6 +19,10 @@ use tauri::{Emitter, Manager, WindowEvent};
 use tauri_plugin_autostart::ManagerExt;
 
 type CommandResult<T> = Result<T, String>;
+
+fn command_result<T, E: Display>(result: Result<T, E>) -> CommandResult<T> {
+    result.map_err(|error| format!("{error:#}"))
+}
 
 #[tauri::command]
 fn get_snapshot(controller: tauri::State<'_, Arc<Controller>>) -> AppSnapshot {
@@ -35,14 +40,12 @@ fn save_settings(
     controller: tauri::State<'_, Arc<Controller>>,
     settings: Settings,
 ) -> CommandResult<()> {
-    controller
-        .save_settings(settings.clone())
-        .map_err(|error| format!("{error:#}"))?;
+    command_result(controller.save_settings(settings.clone()))?;
     let autostart = app.autolaunch();
     if settings.launch_at_login {
-        autostart.enable().map_err(|error| error.to_string())?;
+        command_result(autostart.enable())?;
     } else {
-        autostart.disable().map_err(|error| error.to_string())?;
+        command_result(autostart.disable())?;
     }
     Ok(())
 }
@@ -52,11 +55,9 @@ fn complete_onboarding(
     app: tauri::AppHandle,
     controller: tauri::State<'_, Arc<Controller>>,
 ) -> CommandResult<()> {
-    controller
-        .complete_onboarding()
-        .map_err(|error| format!("{error:#}"))?;
+    command_result(controller.complete_onboarding())?;
     if controller.settings().launch_at_login {
-        app.autolaunch().enable().map_err(|error| error.to_string())?;
+        command_result(app.autolaunch().enable())?;
     }
     Ok(())
 }
@@ -64,20 +65,22 @@ fn complete_onboarding(
 #[tauri::command]
 fn open_accessibility_settings() -> CommandResult<()> {
     let _ = macos::request_accessibility();
-    std::process::Command::new("/usr/bin/open")
-        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-        .spawn()
-        .map_err(|error| error.to_string())?;
+    command_result(
+        std::process::Command::new("/usr/bin/open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+            .spawn(),
+    )?;
     Ok(())
 }
 
 #[tauri::command]
 fn open_input_monitoring_settings() -> CommandResult<()> {
     let _ = macos::request_input_monitoring();
-    std::process::Command::new("/usr/bin/open")
-        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
-        .spawn()
-        .map_err(|error| error.to_string())?;
+    command_result(
+        std::process::Command::new("/usr/bin/open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
+            .spawn(),
+    )?;
     Ok(())
 }
 
@@ -89,7 +92,7 @@ fn refresh_permissions(controller: tauri::State<'_, Arc<Controller>>) -> AppSnap
 
 #[tauri::command]
 fn list_microphones() -> CommandResult<Vec<String>> {
-    audio::input_devices().map_err(|error| format!("{error:#}"))
+    command_result(audio::input_devices())
 }
 
 #[derive(Clone, Serialize)]
@@ -105,8 +108,7 @@ async fn test_microphone(app: tauri::AppHandle, device: Option<String>) -> Comma
         let on_level = Arc::new(move |level| {
             let _ = event_app.emit("voxtype://microphone-test", MicrophoneTestEvent { level });
         });
-        audio::test_microphone(device.as_deref(), on_level)
-            .map_err(|error| format!("{error:#}"))
+        command_result(audio::test_microphone(device.as_deref(), on_level))
     })
     .await
     .map_err(|error| format!("microphone test task failed: {error}"))?
@@ -114,11 +116,7 @@ async fn test_microphone(app: tauri::AppHandle, device: Option<String>) -> Comma
 
 #[tauri::command]
 fn start_model_download(controller: tauri::State<'_, Arc<Controller>>) -> CommandResult<()> {
-    controller
-        .inner()
-        .clone()
-        .start_download()
-        .map_err(|error| format!("{error:#}"))
+    command_result(controller.inner().clone().start_download())
 }
 
 #[tauri::command]
@@ -128,30 +126,22 @@ fn cancel_model_download(controller: tauri::State<'_, Arc<Controller>>) {
 
 #[tauri::command]
 fn load_model(controller: tauri::State<'_, Arc<Controller>>) -> CommandResult<()> {
-    controller.load_model().map_err(|error| format!("{error:#}"))
+    command_result(controller.load_model())
 }
 
 #[tauri::command]
 fn unload_model(controller: tauri::State<'_, Arc<Controller>>) -> CommandResult<()> {
-    controller
-        .unload_model()
-        .map_err(|error| format!("{error:#}"))
+    command_result(controller.unload_model())
 }
 
 #[tauri::command]
 fn remove_model(controller: tauri::State<'_, Arc<Controller>>) -> CommandResult<()> {
-    controller
-        .remove_model()
-        .map_err(|error| format!("{error:#}"))
+    command_result(controller.remove_model())
 }
 
 #[tauri::command]
 fn retry_paste(controller: tauri::State<'_, Arc<Controller>>) -> CommandResult<()> {
-    controller
-        .inner()
-        .clone()
-        .retry_paste()
-        .map_err(|error| format!("{error:#}"))
+    command_result(controller.inner().clone().retry_paste())
 }
 
 #[tauri::command]
@@ -161,11 +151,7 @@ fn discard_recovery(controller: tauri::State<'_, Arc<Controller>>) {
 
 #[tauri::command]
 fn begin_setup_test(controller: tauri::State<'_, Arc<Controller>>) -> CommandResult<()> {
-    controller
-        .inner()
-        .clone()
-        .begin_setup_test()
-        .map_err(|error| format!("{error:#}"))
+    command_result(controller.inner().clone().begin_setup_test())
 }
 
 #[tauri::command]
@@ -179,6 +165,12 @@ pub fn run() {
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            {
+                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                app.set_dock_visibility(false);
+            }
+
             let controller = Controller::new(app.handle().clone())?;
             hotkey::start(&controller);
             controller.start_privacy_watchdog();
@@ -203,6 +195,7 @@ pub fn run() {
             TrayIconBuilder::with_id("voxtype")
                 .icon(icon)
                 .icon_as_template(true)
+                .title("VoxType")
                 .tooltip("VoxType")
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id.as_ref() {

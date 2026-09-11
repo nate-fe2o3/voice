@@ -27,14 +27,6 @@ The first launch guides you through:
 
 Hold **Right Option** by default, speak, and release. Press Escape while recording to cancel. Right Option continues to behave normally when pressed with another key. The shortcut is configurable in Settings.
 
-### Accessibility after replacing a local build
-
-macOS binds Accessibility approval for an ad-hoc-signed app to that exact
-build. If System Settings shows an older VoxType row as enabled while setup
-still says permission is missing, remove the stale row and add
-`/Applications/VoxType.app` again. VoxType requests the current build's entry
-automatically at startup and refreshes its setup state while it runs.
-
 ## Build
 
 ```sh
@@ -45,9 +37,16 @@ npm run bundle:app
 npm run bundle:dmg
 ```
 
-Artifacts are written beneath `src-tauri/target/release/bundle/`. The packaging script applies an ad-hoc hardened-runtime signature, the
-`com.nbutton.voxtype` identifier, and the microphone entitlement before it
-creates the DMG.
+Artifacts are written beneath `src-tauri/target/release/bundle/`. On the first
+local package, the build creates a `VoxType Local Development` signing identity
+in the login keychain. Reusing that identity keeps Accessibility and Input
+Monitoring grants valid when the app is rebuilt. The packaging script also
+applies the hardened runtime, the `com.nbutton.voxtype` identifier, and the
+microphone entitlement before it creates the DMG.
+
+When migrating from an older ad-hoc-signed build, remove its stale VoxType rows
+from Accessibility and Input Monitoring once, then grant the newly installed
+app. Subsequent locally signed builds reuse the same permission grants.
 
 Public distribution requires a Developer ID certificate and notarization, which are intentionally not configured in this repository.
 
@@ -60,7 +59,7 @@ npm test
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 ```
 
-System-wide insertion should be manually exercised in TextEdit, Safari, Chrome, VS Code, Terminal, Slack, and the Copilot app because macOS Accessibility behavior differs across native, browser, Electron, and terminal controls.
+System-wide insertion should be manually exercised in TextEdit, Safari, Chrome, Firefox, VS Code, Terminal, Slack, and the Copilot app because macOS Accessibility behavior differs across native, browser, Electron, and terminal controls.
 
 ## Recognition model
 

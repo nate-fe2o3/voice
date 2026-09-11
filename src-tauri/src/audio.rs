@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, SampleFormat, Stream, StreamConfig};
+use cpal::{Device, SampleFormat, Stream, StreamConfig, SupportedStreamConfig};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -48,9 +48,8 @@ impl AudioRecorder {
                     let supported = device
                         .default_input_config()
                         .context("read default microphone format")?;
-                    let config: StreamConfig = supported.clone().into();
-                    let channels = config.channels as usize;
-                    let source_rate = config.sample_rate.0;
+                    let channels = supported.channels() as usize;
+                    let source_rate = supported.sample_rate().0;
                     let (raw_sender, raw_receiver) = mpsc::sync_channel::<Vec<f32>>(64);
                     let processor = spawn_processor(
                         raw_receiver,
@@ -62,32 +61,17 @@ impl AudioRecorder {
                         capture_voice,
                     );
                     let error_events = event_sender;
-                    let stream = match supported.sample_format() {
-                        SampleFormat::F32 => build_stream::<f32, _>(
-                            &device,
-                            &config,
-                            raw_sender,
-                            |sample| sample,
-                            error_events,
-                        )?,
-                        SampleFormat::I16 => build_stream::<i16, _>(
-                            &device,
-                            &config,
-                            raw_sender,
-                            |sample| sample as f32 / i16::MAX as f32,
-                            error_events,
-                        )?,
-                        SampleFormat::U16 => build_stream::<u16, _>(
-                            &device,
-                            &config,
-                            raw_sender,
-                            |sample| (sample as f32 - 32768.0) / 32768.0,
-                            error_events,
-                        )?,
-                        format => {
-                            anyhow::bail!("unsupported microphone sample format: {format:?}")
-                        }
-                    };
+                    let stream = build_input_stream(
+                        &device,
+                        &supported,
+                        move |samples| {
+                            let _ = raw_sender.try_send(samples);
+                        },
+                        move |error| {
+                            let _ = error_events.try_send(AudioEvent::Error(error));
+                        },
+                        "open microphone stream",
+                    )?;
                     stream.play().context("start microphone")?;
                     let _ = ready_sender.send(Ok(()));
                     while !capture_stop.load(Ordering::Relaxed) {
@@ -148,11 +132,6 @@ pub fn input_devices() -> Result<Vec<String>> {
     Ok(devices)
 }
 
-enum MicrophoneTestEvent {
-    Level(f32),
-    Error(String),
-}
-
 pub fn test_microphone(
     device_name: Option<&str>,
     on_level: Arc<dyn Fn(f32) + Send + Sync>,
@@ -162,26 +141,20 @@ pub fn test_microphone(
     let supported = device
         .default_input_config()
         .context("microphone is unavailable")?;
-    let config: StreamConfig = supported.clone().into();
     let (events, receiver) = mpsc::sync_channel(16);
-    let stream = match supported.sample_format() {
-        SampleFormat::F32 => {
-            build_test_stream::<f32, _>(&device, &config, events, |sample| sample)?
-        }
-        SampleFormat::I16 => build_test_stream::<i16, _>(
-            &device,
-            &config,
-            events,
-            |sample| sample as f32 / i16::MAX as f32,
-        )?,
-        SampleFormat::U16 => build_test_stream::<u16, _>(
-            &device,
-            &config,
-            events,
-            |sample| (sample as f32 - 32768.0) / 32768.0,
-        )?,
-        format => anyhow::bail!("unsupported microphone sample format: {format:?}"),
-    };
+    let level_events = events.clone();
+    let stream = build_input_stream(
+        &device,
+        &supported,
+        move |samples| {
+            let level = normalized_level(samples.into_iter());
+            let _ = level_events.try_send(AudioEvent::Level(level));
+        },
+        move |error| {
+            let _ = events.try_send(AudioEvent::Error(error));
+        },
+        "open microphone test stream",
+    )?;
     stream.play().context("start microphone test")?;
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut last_emit = Instant::now() - Duration::from_secs(1);
@@ -189,14 +162,14 @@ pub fn test_microphone(
 
     while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
         match receiver.recv_timeout(remaining.min(Duration::from_millis(60))) {
-            Ok(MicrophoneTestEvent::Level(level)) => {
+            Ok(AudioEvent::Level(level)) => {
                 peak = peak.max(level);
                 if last_emit.elapsed() >= Duration::from_millis(50) {
                     on_level(level);
                     last_emit = Instant::now();
                 }
             }
-            Ok(MicrophoneTestEvent::Error(error)) => anyhow::bail!(error),
+            Ok(AudioEvent::Error(error)) => anyhow::bail!(error),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 anyhow::bail!("microphone test stream stopped unexpectedly")
@@ -222,56 +195,62 @@ fn find_input_device(host: &cpal::Host, requested: Option<&str>) -> Result<Devic
         .context("no default microphone is configured")
 }
 
-fn build_stream<T, F>(
+fn build_input_stream<D, E>(
     device: &Device,
-    config: &StreamConfig,
-    sender: SyncSender<Vec<f32>>,
-    convert: F,
-    events: SyncSender<AudioEvent>,
+    config: &SupportedStreamConfig,
+    on_data: D,
+    on_error: E,
+    error_context: &'static str,
 ) -> Result<Stream>
 where
-    T: cpal::SizedSample + Send + 'static,
-    F: Fn(T) -> f32 + Send + Copy + 'static,
+    D: FnMut(Vec<f32>) + Send + 'static,
+    E: FnMut(String) + Send + 'static,
 {
-    device
-        .build_input_stream(
-            config,
-            move |data: &[T], _| {
-                let samples = data.iter().copied().map(convert).collect();
-                let _ = sender.try_send(samples);
-            },
-            move |error| {
-                let _ = events.try_send(AudioEvent::Error(error.to_string()));
-            },
-            None,
-        )
-        .context("open microphone stream")
+    let stream_config = config.clone().into();
+    match config.sample_format() {
+        SampleFormat::F32 => {
+            build_typed_input_stream(device, &stream_config, |sample| sample, on_data, on_error)
+        }
+        SampleFormat::I16 => build_typed_input_stream(
+            device,
+            &stream_config,
+            |sample: i16| sample as f32 / i16::MAX as f32,
+            on_data,
+            on_error,
+        ),
+        SampleFormat::U16 => build_typed_input_stream(
+            device,
+            &stream_config,
+            |sample: u16| (sample as f32 - 32768.0) / 32768.0,
+            on_data,
+            on_error,
+        ),
+        format => anyhow::bail!("unsupported microphone sample format: {format:?}"),
+    }
+    .context(error_context)
 }
 
-fn build_test_stream<T, F>(
+fn build_typed_input_stream<T, F, D, E>(
     device: &Device,
     config: &StreamConfig,
-    events: SyncSender<MicrophoneTestEvent>,
     convert: F,
-) -> Result<Stream>
+    mut on_data: D,
+    mut on_error: E,
+) -> std::result::Result<Stream, cpal::BuildStreamError>
 where
     T: cpal::SizedSample + Send + 'static,
     F: Fn(T) -> f32 + Send + Copy + 'static,
+    D: FnMut(Vec<f32>) + Send + 'static,
+    E: FnMut(String) + Send + 'static,
 {
-    let error_events = events.clone();
-    device
-        .build_input_stream(
-            config,
-            move |data: &[T], _| {
-                let level = normalized_level(data.iter().copied().map(convert));
-                let _ = events.try_send(MicrophoneTestEvent::Level(level));
-            },
-            move |error| {
-                let _ = error_events.try_send(MicrophoneTestEvent::Error(error.to_string()));
-            },
-            None,
-        )
-        .context("open microphone test stream")
+    device.build_input_stream(
+        config,
+        move |data: &[T], _| {
+            on_data(data.iter().copied().map(convert).collect());
+        },
+        move |error| on_error(error.to_string()),
+        None,
+    )
 }
 
 fn normalized_level(samples: impl Iterator<Item = f32>) -> f32 {
@@ -310,10 +289,8 @@ fn spawn_processor(
                 let mono = downmix(&chunk, channels);
                 let resampled = resample_linear(&mono, source_rate, TARGET_SAMPLE_RATE);
                 if last_level.elapsed() >= Duration::from_millis(50) {
-                    let rms = (resampled.iter().map(|sample| sample * sample).sum::<f32>()
-                        / resampled.len().max(1) as f32)
-                        .sqrt();
-                    let _ = events.try_send(AudioEvent::Level((rms * 8.0).clamp(0.0, 1.0)));
+                    let level = normalized_level(resampled.iter().copied());
+                    let _ = events.try_send(AudioEvent::Level(level));
                     last_level = Instant::now();
                 }
                 pending.extend_from_slice(&resampled);

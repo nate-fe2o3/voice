@@ -40,6 +40,34 @@ struct PasteRecovery {
     expires: Instant,
 }
 
+trait RetryFocus {
+    fn is_still_focused(&self) -> bool;
+    fn restore_focus(&self) -> Result<()>;
+}
+
+impl RetryFocus for FocusedTarget {
+    fn is_still_focused(&self) -> bool {
+        FocusedTarget::is_still_focused(self)
+    }
+
+    fn restore_focus(&self) -> Result<()> {
+        FocusedTarget::restore_focus(self)
+    }
+}
+
+fn prepare_retry_focus(target: &impl RetryFocus) -> Result<()> {
+    if target.is_still_focused() {
+        return Ok(());
+    }
+    target
+        .restore_focus()
+        .context("return focus to the original text field")?;
+    if !target.is_still_focused() {
+        anyhow::bail!("the original text field did not regain focus");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SetupTestResult {
@@ -360,9 +388,16 @@ impl Controller {
             self.return_ready("Transcript discarded");
             anyhow::bail!("the recovery window expired");
         }
-        if !recovery.target.is_still_focused() {
+        self.hide_overlay();
+        if let Err(error) = prepare_retry_focus(&recovery.target) {
             *self.recovery.lock().expect("recovery lock") = Some(recovery);
-            anyhow::bail!("Refocus the original text field before retrying");
+            let message = format!("{error:#}");
+            self.mutate_snapshot(|snapshot| {
+                snapshot.status = "Could not return to the original text field".into();
+                snapshot.error = Some(message);
+            });
+            self.show_overlay();
+            return Err(error);
         }
         let transcript = recovery.transcript;
         let target = recovery.target;
@@ -591,7 +626,7 @@ impl Controller {
                             self.enter_recovery(
                                 transcript,
                                 target,
-                                "Refocus the original text field, then Retry",
+                                "Click Retry to return to the original text field",
                             );
                         } else if let Err(error) =
                             self.paste_transcript(transcript.clone(), target.clone())
@@ -865,6 +900,12 @@ impl Controller {
         });
     }
 
+    fn hide_overlay(&self) {
+        if let Some(window) = self.app.get_webview_window("overlay") {
+            let _ = window.hide();
+        }
+    }
+
     fn hide_overlay_later(&self, delay: Duration) {
         let app = self.app.clone();
         std::thread::spawn(move || {
@@ -920,6 +961,24 @@ pub fn normalize_transcript(text: &str, language: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    struct FocusStolenByRetryClick {
+        focused: Cell<bool>,
+        restore_attempted: Cell<bool>,
+    }
+
+    impl RetryFocus for FocusStolenByRetryClick {
+        fn is_still_focused(&self) -> bool {
+            self.focused.get()
+        }
+
+        fn restore_focus(&self) -> Result<()> {
+            self.restore_attempted.set(true);
+            self.focused.set(true);
+            Ok(())
+        }
+    }
 
     #[test]
     fn appends_space_for_english() {
@@ -939,5 +998,18 @@ mod tests {
         };
         assert!(can_begin_recording(&snapshot, true));
         assert!(!can_begin_recording(&snapshot, false));
+    }
+
+    #[test]
+    fn retry_restores_focus_stolen_by_overlay_click() {
+        let target = FocusStolenByRetryClick {
+            focused: Cell::new(false),
+            restore_attempted: Cell::new(false),
+        };
+
+        prepare_retry_focus(&target).unwrap();
+
+        assert!(target.restore_attempted.get());
+        assert!(target.focused.get());
     }
 }
