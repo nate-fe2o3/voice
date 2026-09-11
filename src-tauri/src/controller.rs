@@ -846,12 +846,20 @@ impl Controller {
     }
 
     fn mutate_snapshot(&self, mutate: impl FnOnce(&mut AppSnapshot)) {
-        let snapshot = {
+        let (snapshot, model_loaded) = {
             let mut snapshot = self.snapshot.lock().expect("snapshot lock");
+            let was_model_loaded = snapshot.model_loaded;
             mutate(&mut snapshot);
-            snapshot.clone()
+            let model_loaded_changed = was_model_loaded != snapshot.model_loaded;
+            (
+                snapshot.clone(),
+                model_loaded_changed.then_some(snapshot.model_loaded),
+            )
         };
         let _ = self.app.emit("voxtype://snapshot", snapshot);
+        if let Some(loaded) = model_loaded {
+            crate::tray::update_model_indicator(&self.app, loaded);
+        }
     }
 
     fn emit_snapshot(&self) {
