@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use core_foundation::base::{CFType, TCFType};
 use core_foundation::string::{CFString, CFStringRef};
 use core_foundation_sys::base::kCFAllocatorDefault;
-use core_foundation_sys::base::{Boolean, CFEqual, CFRelease, CFRetain, CFTypeRef};
+use core_foundation_sys::base::{Boolean, CFEqual, CFRange, CFRelease, CFRetain, CFTypeRef};
 use core_foundation_sys::dictionary::{
     kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks, CFDictionaryCreate,
     CFDictionaryRef,
@@ -23,6 +23,13 @@ type AxUiElementRef = *const c_void;
 type AxError = i32;
 
 const AX_SUCCESS: AxError = 0;
+
+/// `kAXValueCFRangeType` from `<ApplicationServices/AXValue.h>`.
+const AX_VALUE_CF_RANGE_TYPE: u32 = 4;
+
+/// Most UTF-16 units read immediately before the caret when classifying the
+/// insertion context.
+const INSERTION_PREFIX_UTF16_UNITS: usize = 64;
 
 const COMMAND_KEYCODE: u16 = 55;
 const V_KEYCODE: u16 = 9;
@@ -49,6 +56,14 @@ unsafe extern "C" {
         attribute: CFStringRef,
         value: *mut CFTypeRef,
     ) -> AxError;
+    fn AXUIElementCopyParameterizedAttributeValue(
+        element: AxUiElementRef,
+        parameterized_attribute: CFStringRef,
+        parameter: CFTypeRef,
+        result: *mut CFTypeRef,
+    ) -> AxError;
+    fn AXValueCreate(the_type: u32, value: *const c_void) -> CFTypeRef;
+    fn AXValueGetValue(value: CFTypeRef, the_type: u32, value_ptr: *mut c_void) -> Boolean;
     fn AXUIElementGetPid(element: AxUiElementRef, pid: *mut pid_t) -> AxError;
     fn AXUIElementIsAttributeSettable(
         element: AxUiElementRef,
@@ -77,9 +92,24 @@ pub struct TargetDescription {
     pub role: String,
 }
 
+/// How the caret sits relative to the surrounding text, used to decide whether
+/// a capitalized leading word should be lowered for the current utterance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InsertionContext {
+    /// The surrounding text could not be read.
+    Unknown,
+    /// Nothing precedes the caret (an empty field or the very start).
+    FieldStart,
+    /// The caret follows a sentence-ending character.
+    SentenceBoundary,
+    /// The caret is in the middle of a sentence.
+    MidSentence,
+}
+
 pub struct FocusedTarget {
     element: AxUiElementRef,
     pub description: TargetDescription,
+    pub context: InsertionContext,
 }
 
 unsafe impl Send for FocusedTarget {}
@@ -93,6 +123,7 @@ impl Clone for FocusedTarget {
         Self {
             element: self.element,
             description: self.description.clone(),
+            context: self.context,
         }
     }
 }
@@ -197,8 +228,10 @@ impl FocusedTarget {
             );
             anyhow::bail!("VoxType is disabled for this application");
         }
+        let context = insertion_context(element);
         Ok(Self {
             element,
+            context,
             description: TargetDescription {
                 pid,
                 bundle_id,
@@ -582,6 +615,241 @@ fn copy_string_attribute(element: AxUiElementRef, name: &str) -> Option<String> 
         .map(|string| string.to_string())
 }
 
+/// Reads the text immediately before the caret in `element` and classifies it
+/// as the insertion context for capitalization.
+///
+/// Every accessibility failure is folded into `InsertionContext::Unknown`,
+/// which leaves the transcript untouched.
+fn insertion_context(element: AxUiElementRef) -> InsertionContext {
+    match text_before_caret(element) {
+        Some(prefix) => insertion_context_from_prefix(&prefix),
+        None => InsertionContext::Unknown,
+    }
+}
+
+fn text_before_caret(element: AxUiElementRef) -> Option<String> {
+    let caret = caret_offset(element)?;
+    if caret == 0 {
+        return Some(String::new());
+    }
+    let start = caret.saturating_sub(INSERTION_PREFIX_UTF16_UNITS);
+    let length = caret - start;
+    if let Some(prefix) = string_for_range(element, start, length) {
+        return Some(prefix);
+    }
+    string_prefix(element, caret)
+}
+
+/// Reads the caret offset, in UTF-16 units from the start of the field, from
+/// `AXSelectedTextRange`, which is an `AXValue` wrapping a `CFRange`.
+fn caret_offset(element: AxUiElementRef) -> Option<usize> {
+    let attribute = CFString::new("AXSelectedTextRange");
+    let mut value: CFTypeRef = std::ptr::null();
+    let status = unsafe {
+        AXUIElementCopyAttributeValue(
+            element,
+            attribute.as_concrete_TypeRef(),
+            &mut value as *mut CFTypeRef,
+        )
+    };
+    if status != AX_SUCCESS || value.is_null() {
+        return None;
+    }
+    let value = unsafe { CFType::wrap_under_create_rule(value) };
+    let mut range = CFRange {
+        location: 0,
+        length: 0,
+    };
+    let ok = unsafe {
+        AXValueGetValue(
+            value.as_CFTypeRef(),
+            AX_VALUE_CF_RANGE_TYPE,
+            &mut range as *mut CFRange as *mut c_void,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    usize::try_from(range.location).ok()
+}
+
+/// Reads `length` UTF-16 units starting at `location` through the parameterized
+/// `AXStringForRange` attribute. Applications that do not implement it return
+/// an error, which the caller handles by falling back to the full value.
+fn string_for_range(element: AxUiElementRef, location: usize, length: usize) -> Option<String> {
+    let range = CFRange {
+        location: isize::try_from(location).ok()?,
+        length: isize::try_from(length).ok()?,
+    };
+    let range_value = unsafe {
+        AXValueCreate(
+            AX_VALUE_CF_RANGE_TYPE,
+            &range as *const CFRange as *const c_void,
+        )
+    };
+    if range_value.is_null() {
+        return None;
+    }
+    let attribute = CFString::new("AXStringForRange");
+    let mut result: CFTypeRef = std::ptr::null();
+    let status = unsafe {
+        AXUIElementCopyParameterizedAttributeValue(
+            element,
+            attribute.as_concrete_TypeRef(),
+            range_value,
+            &mut result as *mut CFTypeRef,
+        )
+    };
+    unsafe { CFRelease(range_value) };
+    if status != AX_SUCCESS || result.is_null() {
+        return None;
+    }
+    let result = unsafe { CFType::wrap_under_create_rule(result) };
+    result
+        .downcast::<CFString>()
+        .map(|string| string.to_string())
+}
+
+/// Fallback used when `AXStringForRange` is unavailable: slice the full
+/// `AXValue` string by the caret's UTF-16 offset. AX offsets are UTF-16 code
+/// units, so the string is never sliced by character index.
+fn string_prefix(element: AxUiElementRef, caret: usize) -> Option<String> {
+    let value = copy_string_attribute(element, "AXValue")?;
+    let utf16: Vec<u16> = value.encode_utf16().collect();
+    if caret > utf16.len() {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&utf16[..caret]))
+}
+
+/// Classifies the text immediately before the caret.
+pub fn insertion_context_from_prefix(prefix: &str) -> InsertionContext {
+    let mut candidate = trim_trailing_inline_whitespace(prefix);
+    while let Some(last) = candidate.chars().last() {
+        if is_closing_punctuation(last) {
+            candidate = &candidate[..candidate.len() - last.len_utf8()];
+        } else {
+            break;
+        }
+    }
+    match candidate.chars().last() {
+        None => InsertionContext::FieldStart,
+        Some(last) if is_sentence_boundary(last) => InsertionContext::SentenceBoundary,
+        Some(_) => InsertionContext::MidSentence,
+    }
+}
+
+/// Trims trailing spaces and tabs, but deliberately keeps a trailing newline so
+/// text typed at the start of a new line is still a sentence boundary.
+fn trim_trailing_inline_whitespace(text: &str) -> &str {
+    text.trim_end_matches(|character: char| {
+        character.is_whitespace() && !matches!(character, '\n' | '\r')
+    })
+}
+
+fn is_closing_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        ')' | ']' | '}' | '"' | '\'' | '\u{2019}' | '\u{201d}'
+    )
+}
+
+fn is_sentence_boundary(character: char) -> bool {
+    matches!(character, '.' | '!' | '?' | '\n' | '\r' | '\u{2026}')
+}
+
+/// Lowercases the leading word of a mid-sentence dictation only when it is safe
+/// to do so. Every other insertion context returns `text` unchanged.
+pub fn adjust_leading_capitalization(
+    text: &str,
+    context: InsertionContext,
+    preferred_terms: &[String],
+) -> String {
+    if context != InsertionContext::MidSentence {
+        return text.to_string();
+    }
+    let Some((letter_index, letter)) = leading_capital_letter(text) else {
+        return text.to_string();
+    };
+    let word = word_containing(text, letter_index);
+    if preserves_capitalization(word, preferred_terms) {
+        return text.to_string();
+    }
+    let mut adjusted = String::with_capacity(text.len());
+    adjusted.push_str(&text[..letter_index]);
+    adjusted.push(letter.to_ascii_lowercase());
+    adjusted.push_str(&text[letter_index + letter.len_utf8()..]);
+    adjusted
+}
+
+/// Byte index and character of the first ASCII uppercase letter after any
+/// leading whitespace and opening punctuation. Digits, sentence punctuation and
+/// non-ASCII letters all stop the search without a candidate.
+fn leading_capital_letter(text: &str) -> Option<(usize, char)> {
+    for (index, character) in text.char_indices() {
+        if character.is_whitespace() || is_opening_punctuation(character) {
+            continue;
+        }
+        return character.is_ascii_uppercase().then_some((index, character));
+    }
+    None
+}
+
+fn is_opening_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        '(' | '[' | '{' | '"' | '\'' | '\u{2018}' | '\u{201c}'
+    )
+}
+
+/// The word that starts at `start`, up to the first character that is neither
+/// alphanumeric nor an apostrophe.
+fn word_containing(text: &str, start: usize) -> &str {
+    let rest = &text[start..];
+    let end = rest
+        .char_indices()
+        .find(|(_, character)| !is_word_character(*character))
+        .map(|(index, _)| index)
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+fn is_word_character(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '\'' | '\u{2019}')
+}
+
+fn preserves_capitalization(word: &str, preferred_terms: &[String]) -> bool {
+    is_first_person_pronoun(word)
+        || has_internal_uppercase(word)
+        || is_entirely_uppercase(word)
+        || preferred_terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case(word))
+}
+
+/// The English first-person pronoun and its contractions keep their capital.
+fn is_first_person_pronoun(word: &str) -> bool {
+    if word == "I" {
+        return true;
+    }
+    let Some(rest) = word.strip_prefix('I') else {
+        return false;
+    };
+    let Some(contraction) = rest.strip_prefix(['\'', '\u{2019}']) else {
+        return false;
+    };
+    matches!(contraction, "m" | "ve" | "ll" | "d")
+}
+
+/// Acronyms and camel-case words carry an uppercase letter after the first.
+fn has_internal_uppercase(word: &str) -> bool {
+    word.chars().skip(1).any(char::is_uppercase)
+}
+
+fn is_entirely_uppercase(word: &str) -> bool {
+    word.chars().count() > 1 && !word.chars().any(char::is_lowercase)
+}
+
 fn bundle_identifier(pid: pid_t) -> Option<String> {
     let executable = process_path(pid)?;
     let app = app_bundle_path(&executable)?;
@@ -705,6 +973,152 @@ mod tests {
         assert_eq!(
             warmup_poll_count(Duration::from_millis(2500), Duration::ZERO),
             1
+        );
+    }
+
+    #[test]
+    fn empty_prefix_is_the_start_of_the_field() {
+        assert_eq!(
+            insertion_context_from_prefix(""),
+            InsertionContext::FieldStart
+        );
+        assert_eq!(
+            insertion_context_from_prefix("   "),
+            InsertionContext::FieldStart
+        );
+    }
+
+    #[test]
+    fn sentence_boundary_follows_terminators() {
+        for prefix in ["Hello.", "Done!", "Hello! ", "Hello? ", "Hello\u{2026}"] {
+            assert_eq!(
+                insertion_context_from_prefix(prefix),
+                InsertionContext::SentenceBoundary,
+                "prefix {prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_whitespace_before_the_caret_stays_mid_sentence() {
+        assert_eq!(
+            insertion_context_from_prefix("I went to the store and "),
+            InsertionContext::MidSentence
+        );
+        assert_eq!(
+            insertion_context_from_prefix("Hello"),
+            InsertionContext::MidSentence
+        );
+    }
+
+    #[test]
+    fn newline_is_a_sentence_boundary() {
+        assert_eq!(
+            insertion_context_from_prefix("Hello\n"),
+            InsertionContext::SentenceBoundary
+        );
+        assert_eq!(
+            insertion_context_from_prefix("Hello\r"),
+            InsertionContext::SentenceBoundary
+        );
+    }
+
+    #[test]
+    fn closing_punctuation_is_ignored_when_classifying() {
+        assert_eq!(
+            insertion_context_from_prefix("Well (that is fine)"),
+            InsertionContext::MidSentence
+        );
+        assert_eq!(
+            insertion_context_from_prefix("He said \"go.\""),
+            InsertionContext::SentenceBoundary
+        );
+    }
+
+    #[test]
+    fn mid_sentence_capital_is_lowered() {
+        assert_eq!(
+            adjust_leading_capitalization("Hello", InsertionContext::MidSentence, &[]),
+            "hello"
+        );
+        assert_eq!(
+            adjust_leading_capitalization("Hello world ", InsertionContext::MidSentence, &[]),
+            "hello world "
+        );
+    }
+
+    #[test]
+    fn other_contexts_are_left_untouched() {
+        for context in [
+            InsertionContext::FieldStart,
+            InsertionContext::SentenceBoundary,
+            InsertionContext::Unknown,
+        ] {
+            assert_eq!(
+                adjust_leading_capitalization("Hello there ", context, &[]),
+                "Hello there "
+            );
+        }
+    }
+
+    #[test]
+    fn first_person_pronoun_keeps_its_capital() {
+        assert_eq!(
+            adjust_leading_capitalization("I think so ", InsertionContext::MidSentence, &[]),
+            "I think so "
+        );
+        assert_eq!(
+            adjust_leading_capitalization("I'm ready ", InsertionContext::MidSentence, &[]),
+            "I'm ready "
+        );
+        assert_eq!(
+            adjust_leading_capitalization("I\u{2019}ve tried ", InsertionContext::MidSentence, &[]),
+            "I\u{2019}ve tried "
+        );
+    }
+
+    #[test]
+    fn acronyms_and_camel_case_keep_their_capital() {
+        assert_eq!(
+            adjust_leading_capitalization("VoxType is here ", InsertionContext::MidSentence, &[]),
+            "VoxType is here "
+        );
+        assert_eq!(
+            adjust_leading_capitalization("ASR works ", InsertionContext::MidSentence, &[]),
+            "ASR works "
+        );
+    }
+
+    #[test]
+    fn preferred_terms_keep_their_capital() {
+        let terms = vec!["Qwen".to_string()];
+        assert_eq!(
+            adjust_leading_capitalization("Qwen runs ", InsertionContext::MidSentence, &terms),
+            "Qwen runs "
+        );
+    }
+
+    #[test]
+    fn leading_quote_is_skipped_before_lowering() {
+        assert_eq!(
+            adjust_leading_capitalization("\"Hello", InsertionContext::MidSentence, &[]),
+            "\"hello"
+        );
+        assert_eq!(
+            adjust_leading_capitalization("\u{201c}Hello", InsertionContext::MidSentence, &[]),
+            "\u{201c}hello"
+        );
+    }
+
+    #[test]
+    fn non_letter_leading_characters_are_left_untouched() {
+        assert_eq!(
+            adjust_leading_capitalization("1. Hello ", InsertionContext::MidSentence, &[]),
+            "1. Hello "
+        );
+        assert_eq!(
+            adjust_leading_capitalization("\u{c9}lan ", InsertionContext::MidSentence, &[]),
+            "\u{c9}lan "
         );
     }
 }
