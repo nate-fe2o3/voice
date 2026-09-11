@@ -381,30 +381,36 @@ fn prime_event_pipeline(source: &CGEventSource) -> Result<()> {
     Ok(())
 }
 
-/// `NSWindowCollectionBehaviorCanJoinAllSpaces` from `<AppKit/NSWindow.h>`
-/// (value 1 << 0): the window is shown on every Space rather than only the
-/// Space that was active when it was ordered front.
-const NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES: usize = 1 << 0;
-
-/// `NSWindowCollectionBehaviorStationary` from `<AppKit/NSWindow.h>`
-/// (value 1 << 4): the window does not move during Exposé/Space switches.
-const NS_WINDOW_COLLECTION_BEHAVIOR_STATIONARY: usize = 1 << 4;
+/// `NSWindowCollectionBehaviorMoveToActiveSpace` from `<AppKit/NSWindow.h>`
+/// (value 1 << 1): when the window is ordered on screen it is moved to the
+/// active Space, so a HUD that is hidden and re-shown per recording lands on
+/// the Space the user is currently looking at.
+const NS_WINDOW_COLLECTION_BEHAVIOR_MOVE_TO_ACTIVE_SPACE: usize = 1 << 1;
 
 /// `NSWindowCollectionBehaviorFullScreenAuxiliary` from `<AppKit/NSWindow.h>`
-/// (value 1 << 8): the window may be shown alongside another app's native
-/// fullscreen window on that app's dedicated fullscreen Space.
+/// (value 1 << 8): the window may be shown together with a fullscreen window.
 const NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY: usize = 1 << 8;
 
+/// `NSWindowCollectionBehaviorCanJoinAllApplications` from `<AppKit/NSWindow.h>`
+/// (value 1 << 18, macOS 13+): the header documents this as "allowing it to
+/// join other apps' sets and full screen spaces when eligible" and recommends
+/// it "for floating windows and system overlays" — exactly this recording HUD.
+const NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_APPLICATIONS: usize = 1 << 18;
+
 /// `NSStatusWindowLevel` from `<AppKit/NSWindow.h>`: above normal and floating
-/// windows, so the overlay stays visible over fullscreen apps.
+/// windows, so the overlay stays visible over fullscreen apps once it has
+/// joined their Space.
 const NS_STATUS_WINDOW_LEVEL: isize = 25;
 
-/// Collection behavior that lets the recording HUD join every Space, including
-/// the dedicated Space another app creates when it enters native fullscreen.
+/// Collection behavior that lets the recording HUD join the active Space,
+/// including the dedicated fullscreen Space of another application.
+/// `MoveToActiveSpace` is used (rather than `CanJoinAllSpaces`) because the HUD
+/// is hidden and ordered front again for every recording; it also keeps the
+/// window off unrelated Spaces between recordings.
 fn overlay_collection_behavior() -> usize {
-    NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES
-        | NS_WINDOW_COLLECTION_BEHAVIOR_STATIONARY
+    NS_WINDOW_COLLECTION_BEHAVIOR_MOVE_TO_ACTIVE_SPACE
         | NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY
+        | NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_APPLICATIONS
 }
 
 #[allow(unexpected_cfgs)]
@@ -975,22 +981,25 @@ mod tests {
 
     #[test]
     fn overlay_collection_behavior_matches_named_options() {
-        assert_eq!(overlay_collection_behavior(), 273);
-        assert_eq!(NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES, 1 << 0);
-        assert_eq!(NS_WINDOW_COLLECTION_BEHAVIOR_STATIONARY, 1 << 4);
+        assert_eq!(overlay_collection_behavior(), 262_402);
+        assert_eq!(NS_WINDOW_COLLECTION_BEHAVIOR_MOVE_TO_ACTIVE_SPACE, 1 << 1);
         assert_eq!(NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY, 1 << 8);
+        assert_eq!(
+            NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_APPLICATIONS,
+            1 << 18
+        );
         let behavior = overlay_collection_behavior();
         assert_eq!(
-            behavior & NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES,
-            NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES
-        );
-        assert_eq!(
-            behavior & NS_WINDOW_COLLECTION_BEHAVIOR_STATIONARY,
-            NS_WINDOW_COLLECTION_BEHAVIOR_STATIONARY
+            behavior & NS_WINDOW_COLLECTION_BEHAVIOR_MOVE_TO_ACTIVE_SPACE,
+            NS_WINDOW_COLLECTION_BEHAVIOR_MOVE_TO_ACTIVE_SPACE
         );
         assert_eq!(
             behavior & NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY,
             NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY
+        );
+        assert_eq!(
+            behavior & NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_APPLICATIONS,
+            NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_APPLICATIONS
         );
     }
 
