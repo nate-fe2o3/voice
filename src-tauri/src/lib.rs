@@ -6,6 +6,7 @@ mod macos;
 mod model;
 mod settings;
 mod state;
+mod tray;
 
 use controller::Controller;
 use serde::Serialize;
@@ -214,6 +215,8 @@ pub fn run() {
                     _ => {}
                 })
                 .build(app)?;
+            let model_loaded = app.state::<Arc<Controller>>().snapshot().model_loaded;
+            tray::update_model_indicator(app.handle(), model_loaded);
             if hide_settings {
                 if let Some(window) = app.get_webview_window("settings") {
                     let _ = window.hide();
