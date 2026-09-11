@@ -1,26 +1,32 @@
 use anyhow::{Context, Result};
 use core_foundation::base::{CFType, TCFType};
 use core_foundation::string::{CFString, CFStringRef};
-use core_foundation_sys::base::{Boolean, CFEqual, CFRelease, CFRetain, CFTypeRef};
 use core_foundation_sys::base::kCFAllocatorDefault;
-use core_foundation_sys::number::kCFBooleanTrue;
+use core_foundation_sys::base::{Boolean, CFEqual, CFRelease, CFRetain, CFTypeRef};
 use core_foundation_sys::dictionary::{
     kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks, CFDictionaryCreate,
     CFDictionaryRef,
 };
+use core_foundation_sys::number::kCFBooleanTrue;
+use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton};
+use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use libc::{c_char, c_int, c_void, pid_t};
-use rdev::{simulate, EventType, Key};
 use serde::Serialize;
-use tauri::WebviewWindow;
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
+use tauri::WebviewWindow;
 
 type AxUiElementRef = *const c_void;
 type AxError = i32;
 
 const AX_SUCCESS: AxError = 0;
+
+const COMMAND_KEYCODE: u16 = 55;
+const V_KEYCODE: u16 = 9;
+const POST_DELAYS_MS: [u64; 3] = [12, 20, 20];
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
@@ -215,13 +221,68 @@ pub fn request_input_monitoring() -> bool {
 }
 
 pub fn synthesize_paste() -> Result<()> {
-    simulate(&EventType::KeyPress(Key::MetaLeft)).context("press Command")?;
-    thread::sleep(Duration::from_millis(8));
-    let press = simulate(&EventType::KeyPress(Key::KeyV)).context("press V");
-    let release_v = simulate(&EventType::KeyRelease(Key::KeyV)).context("release V");
-    let release_meta =
-        simulate(&EventType::KeyRelease(Key::MetaLeft)).context("release Command");
-    press.and(release_v).and(release_meta)
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|()| anyhow::anyhow!("create a HID event source"))
+        .context("synthesize Command-V")?;
+    prime_event_pipeline(&source).context("prime the event pipeline")?;
+    let events = build_command_v_events(&source);
+    if events.len() != paste_key_plan().len() {
+        anyhow::bail!("could not create the Command-V keyboard events");
+    }
+    for (index, event) in events.iter().enumerate() {
+        event.post(CGEventTapLocation::HID);
+        if let Some(delay) = POST_DELAYS_MS.get(index) {
+            thread::sleep(Duration::from_millis(*delay));
+        }
+    }
+    Ok(())
+}
+
+/// The Command-down/V-down/V-up/Command-up sequence posted for a paste.
+fn paste_key_plan() -> [(u16, bool); 4] {
+    [
+        (COMMAND_KEYCODE, true),
+        (V_KEYCODE, true),
+        (V_KEYCODE, false),
+        (COMMAND_KEYCODE, false),
+    ]
+}
+
+/// Builds the keyboard events for a paste, forcing the Command flag onto each
+/// one so the sequence can never arrive without Command held.
+fn build_command_v_events(source: &CGEventSource) -> Vec<CGEvent> {
+    paste_key_plan()
+        .into_iter()
+        .filter_map(|(keycode, keydown)| {
+            let event = CGEvent::new_keyboard_event(source.clone(), keycode, keydown).ok()?;
+            event.set_flags(CGEventFlags::CGEventFlagCommand);
+            Some(event)
+        })
+        .collect()
+}
+
+/// Posts a harmless no-op once per process so a dropped first posted event can
+/// never be the Command-down. The mouse-move event targets the current pointer
+/// location, so the cursor does not visibly move.
+fn prime_event_pipeline(source: &CGEventSource) -> Result<()> {
+    static PRIMED: OnceLock<()> = OnceLock::new();
+    if PRIMED.get().is_some() {
+        return Ok(());
+    }
+    let location = CGEvent::new(source.clone())
+        .map_err(|()| anyhow::anyhow!("read the pointer location"))?
+        .location();
+    let event = CGEvent::new_mouse_event(
+        source.clone(),
+        CGEventType::MouseMoved,
+        location,
+        CGMouseButton::Left,
+    )
+    .map_err(|()| anyhow::anyhow!("create the priming event"))?;
+    event.post(CGEventTapLocation::HID);
+    thread::sleep(Duration::from_millis(12));
+    let _ = PRIMED.set(());
+    Ok(())
 }
 
 #[allow(unexpected_cfgs)]
@@ -361,8 +422,13 @@ fn bundle_identifier(pid: pid_t) -> Option<String> {
 
 fn process_path(pid: pid_t) -> Option<PathBuf> {
     let mut buffer = vec![0_u8; 4096];
-    let length =
-        unsafe { proc_pidpath(pid, buffer.as_mut_ptr().cast::<c_void>(), buffer.len() as u32) };
+    let length = unsafe {
+        proc_pidpath(
+            pid,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            buffer.len() as u32,
+        )
+    };
     if length <= 0 {
         return None;
     }
@@ -392,5 +458,26 @@ mod tests {
             app_bundle_path(path).unwrap(),
             Path::new("/Applications/TextEdit.app")
         );
+    }
+
+    #[test]
+    fn paste_key_plan_wraps_v_with_command() {
+        assert_eq!(
+            paste_key_plan(),
+            [(55, true), (9, true), (9, false), (55, false)]
+        );
+    }
+
+    #[test]
+    fn built_command_v_events_all_carry_command_flag() {
+        let source = match CGEventSource::new(CGEventSourceStateID::HIDSystemState) {
+            Ok(source) => source,
+            Err(()) => return,
+        };
+        let events = build_command_v_events(&source);
+        assert_eq!(events.len(), 4);
+        for event in &events {
+            assert!(event.get_flags().contains(CGEventFlags::CGEventFlagCommand));
+        }
     }
 }
