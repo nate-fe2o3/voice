@@ -8,6 +8,7 @@ use core_foundation_sys::dictionary::{
     CFDictionaryRef,
 };
 use core_foundation_sys::number::kCFBooleanTrue;
+use core_foundation_sys::string::CFStringGetLength;
 use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use libc::{c_char, c_int, c_void, pid_t};
@@ -30,6 +31,10 @@ const AX_VALUE_CF_RANGE_TYPE: u32 = 4;
 /// Most UTF-16 units read immediately before the caret when classifying the
 /// insertion context.
 const INSERTION_PREFIX_UTF16_UNITS: usize = 64;
+
+/// Upper bound on the full-field fallback read, in UTF-16 units, so a very
+/// large document never forces a multi-megabyte copy on the hotkey thread.
+const INSERTION_VALUE_UNIT_LIMIT: isize = 262_144;
 
 const COMMAND_KEYCODE: u16 = 55;
 const V_KEYCODE: u16 = 9;
@@ -334,17 +339,22 @@ fn paste_key_plan() -> [(u16, bool); 4] {
     ]
 }
 
-/// Builds the keyboard events for a paste, forcing the Command flag onto each
-/// one so the sequence can never arrive without Command held.
+/// Builds the keyboard events for a paste, forcing the Command flag onto the
+/// key events so the sequence can never arrive without Command held. The final
+/// Command key-up clears the flag so it matches the physical modifier state.
 fn build_command_v_events(source: &CGEventSource) -> Vec<CGEvent> {
-    paste_key_plan()
+    let mut events: Vec<CGEvent> = paste_key_plan()
         .into_iter()
         .filter_map(|(keycode, keydown)| {
             let event = CGEvent::new_keyboard_event(source.clone(), keycode, keydown).ok()?;
             event.set_flags(CGEventFlags::CGEventFlagCommand);
             Some(event)
         })
-        .collect()
+        .collect();
+    if let Some(release) = events.last_mut() {
+        release.set_flags(CGEventFlags::empty());
+    }
+    events
 }
 
 /// Posts a harmless no-op once per process so a dropped first posted event can
@@ -712,10 +722,29 @@ fn string_for_range(element: AxUiElementRef, location: usize, length: usize) -> 
 
 /// Fallback used when `AXStringForRange` is unavailable: slice the full
 /// `AXValue` string by the caret's UTF-16 offset. AX offsets are UTF-16 code
-/// units, so the string is never sliced by character index.
+/// units, so the string is never sliced by character index. Fields larger than
+/// `INSERTION_VALUE_UNIT_LIMIT` units are skipped so a huge document cannot
+/// force a large copy on the hotkey thread; the context then stays `Unknown`.
 fn string_prefix(element: AxUiElementRef, caret: usize) -> Option<String> {
-    let value = copy_string_attribute(element, "AXValue")?;
-    let utf16: Vec<u16> = value.encode_utf16().collect();
+    let attribute = CFString::new("AXValue");
+    let mut raw: CFTypeRef = std::ptr::null();
+    let status = unsafe {
+        AXUIElementCopyAttributeValue(
+            element,
+            attribute.as_concrete_TypeRef(),
+            &mut raw as *mut CFTypeRef,
+        )
+    };
+    if status != AX_SUCCESS || raw.is_null() {
+        return None;
+    }
+    let value = unsafe { CFType::wrap_under_create_rule(raw) };
+    let string = value.downcast::<CFString>()?;
+    let units = unsafe { CFStringGetLength(string.as_concrete_TypeRef()) };
+    if units <= 0 || units > INSERTION_VALUE_UNIT_LIMIT {
+        return None;
+    }
+    let utf16: Vec<u16> = string.to_string().encode_utf16().collect();
     if caret > utf16.len() {
         return None;
     }
@@ -725,11 +754,13 @@ fn string_prefix(element: AxUiElementRef, caret: usize) -> Option<String> {
 /// Classifies the text immediately before the caret.
 pub fn insertion_context_from_prefix(prefix: &str) -> InsertionContext {
     let mut candidate = trim_trailing_inline_whitespace(prefix);
-    while let Some(last) = candidate.chars().last() {
-        if is_closing_punctuation(last) {
-            candidate = &candidate[..candidate.len() - last.len_utf8()];
-        } else {
-            break;
+    loop {
+        candidate = trim_trailing_inline_whitespace(candidate);
+        match candidate.chars().last() {
+            Some(last) if is_closing_punctuation(last) => {
+                candidate = &candidate[..candidate.len() - last.len_utf8()];
+            }
+            _ => break,
         }
     }
     match candidate.chars().last() {
@@ -771,8 +802,7 @@ pub fn adjust_leading_capitalization(
     let Some((letter_index, letter)) = leading_capital_letter(text) else {
         return text.to_string();
     };
-    let word = word_containing(text, letter_index);
-    if preserves_capitalization(word, preferred_terms) {
+    if preserves_capitalization(&text[letter_index..], preferred_terms) {
         return text.to_string();
     }
     let mut adjusted = String::with_capacity(text.len());
@@ -803,7 +833,7 @@ fn is_opening_punctuation(character: char) -> bool {
 }
 
 /// The word that starts at `start`, up to the first character that is neither
-/// alphanumeric nor an apostrophe.
+/// alphanumeric, an apostrophe, nor a hyphen.
 fn word_containing(text: &str, start: usize) -> &str {
     let rest = &text[start..];
     let end = rest
@@ -815,16 +845,33 @@ fn word_containing(text: &str, start: usize) -> &str {
 }
 
 fn is_word_character(character: char) -> bool {
-    character.is_alphanumeric() || matches!(character, '\'' | '\u{2019}')
+    character.is_alphanumeric() || matches!(character, '\'' | '\u{2019}' | '-')
 }
 
-fn preserves_capitalization(word: &str, preferred_terms: &[String]) -> bool {
+fn preserves_capitalization(text_at_start: &str, preferred_terms: &[String]) -> bool {
+    let word = word_containing(text_at_start, 0);
     is_first_person_pronoun(word)
         || has_internal_uppercase(word)
         || is_entirely_uppercase(word)
         || preferred_terms
             .iter()
-            .any(|term| term.eq_ignore_ascii_case(word))
+            .any(|term| starts_with_preferred_term(text_at_start, term))
+}
+
+/// True when `text` begins with `term` (ASCII case-insensitive) followed by a
+/// non-word boundary, so multi-word and hyphenated preferred terms are kept.
+fn starts_with_preferred_term(text: &str, term: &str) -> bool {
+    if term.is_empty() {
+        return false;
+    }
+    let Some(prefix) = text.get(..term.len()) else {
+        return false;
+    };
+    prefix.eq_ignore_ascii_case(term)
+        && text[term.len()..]
+            .chars()
+            .next()
+            .is_none_or(|next| !next.is_alphanumeric())
 }
 
 /// The English first-person pronoun and its contractions keep their capital.
@@ -911,16 +958,19 @@ mod tests {
     }
 
     #[test]
-    fn built_command_v_events_all_carry_command_flag() {
+    fn built_command_v_events_force_command_except_release() {
         let source = match CGEventSource::new(CGEventSourceStateID::HIDSystemState) {
             Ok(source) => source,
             Err(()) => return,
         };
         let events = build_command_v_events(&source);
         assert_eq!(events.len(), 4);
-        for event in &events {
+        for event in &events[..3] {
             assert!(event.get_flags().contains(CGEventFlags::CGEventFlagCommand));
         }
+        assert!(!events[3]
+            .get_flags()
+            .contains(CGEventFlags::CGEventFlagCommand));
     }
 
     #[test]
@@ -1119,6 +1169,43 @@ mod tests {
         assert_eq!(
             adjust_leading_capitalization("\u{c9}lan ", InsertionContext::MidSentence, &[]),
             "\u{c9}lan "
+        );
+    }
+
+    #[test]
+    fn closing_punctuation_after_a_space_still_boundary() {
+        assert_eq!(
+            insertion_context_from_prefix("Hello. \""),
+            InsertionContext::SentenceBoundary
+        );
+        assert_eq!(
+            insertion_context_from_prefix("Really? \u{201d} "),
+            InsertionContext::SentenceBoundary
+        );
+    }
+
+    #[test]
+    fn hyphenated_and_multi_word_terms_keep_their_capital() {
+        let terms = vec!["Node-RED".to_string(), "San Francisco".to_string()];
+        assert_eq!(
+            adjust_leading_capitalization(
+                "Node-RED is great ",
+                InsertionContext::MidSentence,
+                &terms
+            ),
+            "Node-RED is great "
+        );
+        assert_eq!(
+            adjust_leading_capitalization(
+                "San Francisco is nice ",
+                InsertionContext::MidSentence,
+                &terms
+            ),
+            "San Francisco is nice "
+        );
+        assert_eq!(
+            adjust_leading_capitalization("Wi-Fi works ", InsertionContext::MidSentence, &[]),
+            "Wi-Fi works "
         );
     }
 }

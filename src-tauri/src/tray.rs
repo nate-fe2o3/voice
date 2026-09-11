@@ -27,10 +27,9 @@ pub fn update_model_indicator(app: &AppHandle, loaded: bool) {
         Some(tauri::image::Image::new_owned(rgba, width, height))
     };
 
-    let _ = tray.set_icon(icon);
-    // `TrayIcon::set_icon` renders with template = false, so re-assert the template
-    // flag after every icon swap to keep the monochrome menu-bar treatment.
-    let _ = tray.set_icon_as_template(true);
+    // Tauri renders twice (and briefly non-template) when set_icon and
+    // set_icon_as_template are called separately; the combined call is atomic.
+    let _ = tray.set_icon_with_as_template(icon, true);
     let tooltip = if loaded {
         "VoxType - model loaded"
     } else {
