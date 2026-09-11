@@ -382,9 +382,7 @@ fn prime_event_pipeline(source: &CGEventSource) -> Result<()> {
 }
 
 /// `NSWindowCollectionBehaviorMoveToActiveSpace` from `<AppKit/NSWindow.h>`
-/// (value 1 << 1): when the window is ordered on screen it is moved to the
-/// active Space, so a HUD that is hidden and re-shown per recording lands on
-/// the Space the user is currently looking at.
+/// (value 1 << 1): an ordered window is moved to the Space that is active.
 const NS_WINDOW_COLLECTION_BEHAVIOR_MOVE_TO_ACTIVE_SPACE: usize = 1 << 1;
 
 /// `NSWindowCollectionBehaviorFullScreenAuxiliary` from `<AppKit/NSWindow.h>`
@@ -392,9 +390,8 @@ const NS_WINDOW_COLLECTION_BEHAVIOR_MOVE_TO_ACTIVE_SPACE: usize = 1 << 1;
 const NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY: usize = 1 << 8;
 
 /// `NSWindowCollectionBehaviorCanJoinAllApplications` from `<AppKit/NSWindow.h>`
-/// (value 1 << 18, macOS 13+): the header documents this as "allowing it to
-/// join other apps' sets and full screen spaces when eligible" and recommends
-/// it "for floating windows and system overlays" — exactly this recording HUD.
+/// (value 1 << 18, macOS 13+): a floating window or system overlay may join
+/// other applications' full screen spaces.
 const NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_APPLICATIONS: usize = 1 << 18;
 
 /// `NSStatusWindowLevel` from `<AppKit/NSWindow.h>`: above normal and floating
@@ -467,13 +464,12 @@ fn focused_element_with_timeout(timeout: Duration) -> Result<AxUiElementRef> {
         return Ok(focused);
     }
 
-    // Firefox (Gecko) and Chromium keep their macOS accessibility tree
-    // disabled until an assistive client explicitly opts in, so enable the
-    // frontmost application before querying its element tree.
-    warm_up_frontmost_application();
-
+    // Firefox (Gecko) and Chromium only build their macOS accessibility tree
+    // after an assistive client opts in (see [`warm_up_accessibility`]), so send
+    // the opt-in before querying the frontmost application's element tree.
     let pid = frontmost_application_pid()
         .context("identify the frontmost application for accessibility fallback")?;
+    warm_up_accessibility(pid);
     let application = unsafe { AXUIElementCreateApplication(pid) };
     if application.is_null() {
         anyhow::bail!("could not access the frontmost application");
@@ -510,7 +506,7 @@ fn focused_element_for_application(application: AxUiElementRef) -> Option<AxUiEl
     if let Some(focused) = copy_focused_element(application) {
         return Some(focused);
     }
-    let window = copy_element_attribute(application, "AXFocusedWindow")?;
+    let window = copy_attribute(application, "AXFocusedWindow")?;
     let focused = copy_focused_element(window);
     unsafe { CFRelease(window) };
     focused
@@ -525,7 +521,7 @@ fn focused_element_for_application(application: AxUiElementRef) -> Option<AxUiEl
 /// the Firefox/WebKit opt-in and `AXManualAccessibility` the Chromium/Electron
 /// one; an application that does not support a given attribute returns an
 /// error that is expected and ignored.
-fn warm_up_accessibility(pid: i32) {
+pub(crate) fn warm_up_accessibility(pid: i32) {
     let application = unsafe { AXUIElementCreateApplication(pid) };
     if application.is_null() {
         return;
@@ -542,16 +538,6 @@ fn warm_up_accessibility(pid: i32) {
         log::debug!("accessibility warm-up pid={pid} attribute={attribute} status={status}");
     }
     unsafe { CFRelease(application) };
-}
-
-/// Enable accessibility for the frontmost application, ignoring any failure.
-///
-/// Exposed so the privacy watchdog can warm an application up as soon as it
-/// becomes frontmost, before the user reaches for the dictation hotkey.
-pub fn warm_up_frontmost_application() {
-    if let Ok(pid) = frontmost_application_pid() {
-        warm_up_accessibility(pid);
-    }
 }
 
 /// Number of polls to attempt before `timeout` elapses. Extracted so the retry
@@ -571,10 +557,13 @@ fn log_capture_failure(pid: i32, role: &str, bundle_id: Option<&str>, error: &st
 }
 
 fn copy_focused_element(element: AxUiElementRef) -> Option<AxUiElementRef> {
-    copy_element_attribute(element, "AXFocusedUIElement")
+    copy_attribute(element, "AXFocusedUIElement")
 }
 
-fn copy_element_attribute(element: AxUiElementRef, name: &str) -> Option<AxUiElementRef> {
+/// Copy an accessibility attribute value, returning the Core Foundation owning
+/// reference (create rule). The caller must `CFRelease` it, or wrap it with
+/// [`copy_attribute_value`] so it is released on drop.
+fn copy_attribute(element: AxUiElementRef, name: &str) -> Option<CFTypeRef> {
     let attribute = CFString::new(name);
     let mut value: CFTypeRef = std::ptr::null();
     let status = unsafe {
@@ -587,7 +576,13 @@ fn copy_element_attribute(element: AxUiElementRef, name: &str) -> Option<AxUiEle
     if status != AX_SUCCESS || value.is_null() {
         return None;
     }
-    Some(value.cast())
+    Some(value)
+}
+
+/// Copy an accessibility attribute value and take ownership of it as a
+/// `CFType`, which releases the value on drop.
+fn copy_attribute_value(element: AxUiElementRef, name: &str) -> Option<CFType> {
+    Some(unsafe { CFType::wrap_under_create_rule(copy_attribute(element, name)?) })
 }
 
 #[allow(unexpected_cfgs)]
@@ -613,20 +608,7 @@ pub fn frontmost_application_pid() -> Result<pid_t> {
 }
 
 fn copy_string_attribute(element: AxUiElementRef, name: &str) -> Option<String> {
-    let attribute = CFString::new(name);
-    let mut value: CFTypeRef = std::ptr::null();
-    let status = unsafe {
-        AXUIElementCopyAttributeValue(
-            element,
-            attribute.as_concrete_TypeRef(),
-            &mut value as *mut CFTypeRef,
-        )
-    };
-    if status != AX_SUCCESS || value.is_null() {
-        return None;
-    }
-    let value = unsafe { CFType::wrap_under_create_rule(value) };
-    value
+    copy_attribute_value(element, name)?
         .downcast::<CFString>()
         .map(|string| string.to_string())
 }
@@ -659,19 +641,7 @@ fn text_before_caret(element: AxUiElementRef) -> Option<String> {
 /// Reads the caret offset, in UTF-16 units from the start of the field, from
 /// `AXSelectedTextRange`, which is an `AXValue` wrapping a `CFRange`.
 fn caret_offset(element: AxUiElementRef) -> Option<usize> {
-    let attribute = CFString::new("AXSelectedTextRange");
-    let mut value: CFTypeRef = std::ptr::null();
-    let status = unsafe {
-        AXUIElementCopyAttributeValue(
-            element,
-            attribute.as_concrete_TypeRef(),
-            &mut value as *mut CFTypeRef,
-        )
-    };
-    if status != AX_SUCCESS || value.is_null() {
-        return None;
-    }
-    let value = unsafe { CFType::wrap_under_create_rule(value) };
+    let value = copy_attribute_value(element, "AXSelectedTextRange")?;
     let mut range = CFRange {
         location: 0,
         length: 0,
@@ -732,20 +702,7 @@ fn string_for_range(element: AxUiElementRef, location: usize, length: usize) -> 
 /// `INSERTION_VALUE_UNIT_LIMIT` units are skipped so a huge document cannot
 /// force a large copy on the hotkey thread; the context then stays `Unknown`.
 fn string_prefix(element: AxUiElementRef, caret: usize) -> Option<String> {
-    let attribute = CFString::new("AXValue");
-    let mut raw: CFTypeRef = std::ptr::null();
-    let status = unsafe {
-        AXUIElementCopyAttributeValue(
-            element,
-            attribute.as_concrete_TypeRef(),
-            &mut raw as *mut CFTypeRef,
-        )
-    };
-    if status != AX_SUCCESS || raw.is_null() {
-        return None;
-    }
-    let value = unsafe { CFType::wrap_under_create_rule(raw) };
-    let string = value.downcast::<CFString>()?;
+    let string = copy_attribute_value(element, "AXValue")?.downcast::<CFString>()?;
     let units = unsafe { CFStringGetLength(string.as_concrete_TypeRef()) };
     if units <= 0 || units > INSERTION_VALUE_UNIT_LIMIT {
         return None;

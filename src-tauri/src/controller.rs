@@ -514,13 +514,12 @@ impl Controller {
                         .is_ok_and(|elapsed| elapsed > Duration::from_secs(10));
                     let trusted = macos::accessibility_trusted();
                     let input_monitoring_trusted = macos::input_monitoring_trusted();
-                    // A browser (Firefox) keeps its accessibility tree disabled
-                    // until an assistive client opts in, so warm the frontmost
-                    // application up as soon as the user switches to it. Errors
-                    // are ignored and this never blocks the watchdog loop.
+                    // Warm the frontmost application as soon as the user
+                    // switches to it, so its accessibility tree is ready before
+                    // the dictation hotkey. Errors are ignored.
                     let frontmost_pid = macos::frontmost_application_pid().unwrap_or_default();
                     if frontmost_pid != 0 && frontmost_pid != last_frontmost_pid {
-                        macos::warm_up_frontmost_application();
+                        macos::warm_up_accessibility(frontmost_pid);
                     }
                     last_frontmost_pid = frontmost_pid;
                     if slept
